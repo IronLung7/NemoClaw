@@ -2030,7 +2030,17 @@ NODE
     local npm_root
     npm_root="$(npm root -g 2>/dev/null)" || return 0
     [ -n "$npm_root" ] || return 0
-    templates_dir="${npm_root}/openclaw/dist/docs/reference/templates"
+    local openclaw_pkg="${npm_root}/openclaw"
+    local candidate
+    templates_dir="${openclaw_pkg}/docs/reference/templates"
+    for candidate in \
+      "${openclaw_pkg}/docs/reference/templates" \
+      "${openclaw_pkg}/dist/docs/reference/templates"; do
+      if [ -d "$candidate" ]; then
+        templates_dir="$candidate"
+        break
+      fi
+    done
   fi
   if [ ! -d "$templates_dir" ]; then
     echo "[setup] openclaw templates dir not found at ${templates_dir}; skipping workspace seed" >&2
@@ -2324,7 +2334,7 @@ provision_agent_workspaces
 # Run as the sandbox user so the seeded files inherit sandbox:sandbox
 # ownership (the function's own cp calls would otherwise produce
 # root-owned files in this branch). See function comment for context.
-gosu sandbox bash -c "$(declare -f seed_default_workspace_templates); seed_default_workspace_templates /sandbox/.openclaw/workspace '' /sandbox/.openclaw/openclaw.json"
+"${STEP_DOWN_PREFIX_SANDBOX[@]}" bash -c "$(declare -f seed_default_workspace_templates); seed_default_workspace_templates /sandbox/.openclaw/workspace '' /sandbox/.openclaw/openclaw.json"
 
 # Defence-in-depth: verify /tmp file permissions before launching services.
 # Pass the HTTP proxy-fix path so it is validated alongside proxy-env.sh
