@@ -1704,6 +1704,45 @@ describe("seed_default_workspace_templates (#3240)", () => {
     }
   });
 
+  it("resolves the OpenClaw package root from the openclaw binary", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-seed-openclaw-bin-"));
+    const workspaceDir = path.join(tmpDir, "workspace");
+    const openclawPkg = path.join(tmpDir, "openclaw-package");
+    const binDir = path.join(openclawPkg, "bin");
+    const npmRoot = path.join(tmpDir, "empty-npm-root");
+    const templatesDir = path.join(openclawPkg, "docs", "reference", "templates");
+    fs.mkdirSync(workspaceDir, { recursive: true });
+    fs.mkdirSync(binDir, { recursive: true });
+    fs.mkdirSync(npmRoot, { recursive: true });
+    writeTemplates(templatesDir);
+    fs.writeFileSync(path.join(binDir, "openclaw"), "#!/usr/bin/env bash\nexit 0\n", {
+      mode: 0o700,
+    });
+    fs.writeFileSync(
+      path.join(binDir, "npm"),
+      [
+        "#!/usr/bin/env bash",
+        'if [ "${1:-}" = "root" ] && [ "${2:-}" = "-g" ]; then',
+        `  printf '%s\n' ${JSON.stringify(npmRoot)}`,
+        "  exit 0",
+        "fi",
+        "exit 2",
+      ].join("\n"),
+      { mode: 0o700 },
+    );
+
+    try {
+      const result = runSeed(workspaceDir, "", path.join(tmpDir, "seed.sh"), {
+        env: { PATH: `${binDir}:${process.env.PATH || ""}` },
+      });
+      expect(result.status).toBe(0);
+      expect(fs.existsSync(path.join(workspaceDir, "SOUL.md"))).toBe(true);
+      expect(result.stderr).toContain("seeded 6 default workspace template");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   it("does not seed unless OpenClaw bootstrap is explicitly skipped", () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-seed-bootstrap-on-"));
     const workspaceDir = path.join(tmpDir, "workspace");

@@ -2028,22 +2028,41 @@ NODE
   fi
   if [ -z "$templates_dir" ]; then
     local npm_root
-    npm_root="$(npm root -g 2>/dev/null)" || return 0
-    [ -n "$npm_root" ] || return 0
+    npm_root="$(npm root -g 2>/dev/null || true)"
     local openclaw_pkg="${npm_root}/openclaw"
-    local candidate
-    templates_dir="${openclaw_pkg}/docs/reference/templates"
+    local candidate openclaw_bin openclaw_real searched_template_dirs=""
+    templates_dir=""
     for candidate in \
       "${openclaw_pkg}/docs/reference/templates" \
-      "${openclaw_pkg}/dist/docs/reference/templates"; do
+      "${openclaw_pkg}/dist/docs/reference/templates" \
+      "/usr/local/lib/node_modules/openclaw/docs/reference/templates" \
+      "/usr/local/lib/node_modules/openclaw/dist/docs/reference/templates"; do
+      searched_template_dirs="${searched_template_dirs}${searched_template_dirs:+, }${candidate}"
       if [ -d "$candidate" ]; then
         templates_dir="$candidate"
         break
       fi
     done
+    if [ -z "$templates_dir" ] && openclaw_bin="$(command -v openclaw 2>/dev/null)"; then
+      openclaw_real="$(readlink -f "$openclaw_bin" 2>/dev/null || printf '%s\\n' "$openclaw_bin")"
+      openclaw_pkg="$(cd "$(dirname "$openclaw_real")/.." 2>/dev/null && pwd -P || true)"
+      for candidate in \
+        "${openclaw_pkg}/docs/reference/templates" \
+        "${openclaw_pkg}/dist/docs/reference/templates"; do
+        searched_template_dirs="${searched_template_dirs}${searched_template_dirs:+, }${candidate}"
+        if [ -d "$candidate" ]; then
+          templates_dir="$candidate"
+          break
+        fi
+      done
+    fi
   fi
-  if [ ! -d "$templates_dir" ]; then
-    echo "[setup] openclaw templates dir not found at ${templates_dir}; skipping workspace seed" >&2
+  if [ -z "$templates_dir" ] || [ ! -d "$templates_dir" ]; then
+    if [ -n "${searched_template_dirs:-}" ]; then
+      echo "[setup] openclaw workspace templates dir not found; tried: ${searched_template_dirs}; skipping default workspace seed" >&2
+    else
+      echo "[setup] openclaw workspace templates dir not found: ${templates_dir}; skipping default workspace seed" >&2
+    fi
     return 0
   fi
   local file src dst tmp seeded=0
