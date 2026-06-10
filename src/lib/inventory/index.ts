@@ -4,6 +4,7 @@
 import { CLI_NAME } from "../cli/branding";
 import type { GatewayInference } from "../inference/config";
 import { redactFull } from "../security/redact";
+import { resolveDefaultSandboxName } from "../tunnel/service-command";
 
 export interface SandboxEntry {
   name: string;
@@ -100,6 +101,13 @@ export interface ShowStatusCommandDeps {
   showServiceStatus: (options: { sandboxName?: string }) => void;
   getServiceStatuses?: (options: { sandboxName?: string }) => StatusServiceRow[];
   /**
+   * Active SSH-session count for a sandbox. When provided, `showStatusCommand`
+   * emits a `Connected:` line under each sandbox row. Returns null when the
+   * probe is not available (e.g. no openshell binary); the line is omitted in
+   * that case. #2604.
+   */
+  getActiveSessionCount?: (sandboxName: string) => number | null;
+  /**
    * Report whether the named NemoClaw gateway is reachable. When omitted,
    * `showStatusCommand` keeps its legacy 0-exit behaviour; when provided and
    * the gateway is unhealthy, `showStatusCommand` emits a `gateway: down`
@@ -191,7 +199,8 @@ export async function getSandboxInventory(
   deps: ListSandboxesCommandDeps,
 ): Promise<SandboxInventoryResult> {
   const recovery = await deps.recoverRegistryEntries();
-  const defaultSandbox = recovery.defaultSandbox || null;
+  const resolvedDefault =
+    resolveDefaultSandboxName(() => ({ defaultSandbox: recovery.defaultSandbox ?? null })) ?? null;
   const lastSession = deps.loadLastSession();
   // #2753: only surface the last-onboarded name when its sandbox step
   // actually completed. Otherwise an interrupted onboard would leave the
@@ -203,14 +212,14 @@ export async function getSandboxInventory(
 
   return {
     schemaVersion: 1,
-    defaultSandbox,
+    defaultSandbox: resolvedDefault,
     recovery: {
       recoveredFromSession: recovery.recoveredFromSession === true,
       recoveredFromGateway: recovery.recoveredFromGateway || 0,
     },
     lastOnboardedSandbox,
     sandboxes: recovery.sandboxes.map((sandbox) =>
-      buildSandboxInventoryRow(sandbox, defaultSandbox, deps.getActiveSessionCount),
+      buildSandboxInventoryRow(sandbox, resolvedDefault, deps.getActiveSessionCount),
     ),
   };
 }
@@ -220,11 +229,11 @@ export async function getSandboxInventory(
  * cluster-wide gateway is currently serving) the live gateway `model`/
  * `provider` take precedence over the onboarded snapshot so the CLI agrees
  * with `openshell inference get` (#2369); when they drift from stored values
- * a `(onboarded: …)` line is appended. Non-default sandboxes keep their
- * stored config — the gateway only applies to one sandbox at a time, and
- * each non-default sandbox swaps the gateway back to its stored config on
- * its next `connect`. Falls back to stored values when `liveInference`
- * is `null` (gateway unreachable).
+ * an explicit live-gateway annotation is appended. Non-default sandboxes keep
+ * their stored config — the gateway only applies to one sandbox at a time,
+ * and each non-default sandbox swaps the gateway back to its stored config on
+ * its next `connect`. Falls back to stored values when `liveInference` is
+ * `null` (gateway unreachable).
  */
 export function renderSandboxInventoryText(
   inventory: SandboxInventoryResult,
@@ -280,7 +289,7 @@ export function renderSandboxInventoryText(
       const parts: string[] = [];
       if (modelDrifted) parts.push(`model=${sandbox.model || "unknown"}`);
       if (providerDrifted) parts.push(`provider=${sandbox.provider || "unknown"}`);
-      log(`      (onboarded: ${parts.join(", ")})`);
+      log(`      (live OpenShell gateway differs from onboarded: ${parts.join(", ")})`);
     }
     if (sandbox.dashboardPort != null) {
       log(`      dashboard: http://127.0.0.1:${sandbox.dashboardPort}/`);
@@ -354,8 +363,9 @@ function normalizeGatewayHealth(health: GatewayHealth | null | undefined): Gatew
 }
 
 export function getStatusReport(deps: ShowStatusCommandDeps): StatusReport {
-  const { sandboxes, defaultSandbox } = deps.listSandboxes();
-  const resolvedDefault = defaultSandbox || null;
+  const sandboxList = deps.listSandboxes();
+  const { sandboxes } = sandboxList;
+  const resolvedDefault = resolveDefaultSandboxName(() => sandboxList) ?? null;
   const liveInference = sandboxes.length > 0 ? deps.getLiveInference() : null;
   const gatewayHealth =
     deps.getGatewayHealth && sandboxes.length > 0 ? deps.getGatewayHealth() : null;
@@ -391,22 +401,43 @@ export function getStatusReport(deps: ShowStatusCommandDeps): StatusReport {
  */
 export function showStatusCommand(deps: ShowStatusCommandDeps): void {
   const log = deps.log ?? console.log;
-  const { sandboxes, defaultSandbox } = deps.listSandboxes();
+  const sandboxList = deps.listSandboxes();
+  const { sandboxes } = sandboxList;
+  const resolvedDefault = resolveDefaultSandboxName(() => sandboxList) ?? null;
   if (sandboxes.length > 0) {
     const live = deps.getLiveInference();
     log("");
     log("  Sandboxes:");
     for (const sb of sandboxes) {
-      const isDefault = sb.name === defaultSandbox;
+      const isDefault = sb.name === resolvedDefault;
       const def = isDefault ? " *" : "";
       // Prefer the live gateway model for the default sandbox so `status`
       // agrees with `openshell inference get` (#2369).
       const liveModel = isDefault && live ? live.model : null;
+      const liveProvider = isDefault && live ? live.provider : null;
       const model = liveModel || sb.model;
+      const provider = liveProvider || sb.provider;
       const portSuffix = sb.dashboardPort != null ? ` :${sb.dashboardPort}` : "";
       log(`    ${sb.name}${def}${model ? ` (${model})` : ""}${portSuffix}`);
       if (isDefault && liveModel && liveModel !== sb.model) {
         log(`      (onboarded: ${sb.model || "unknown"})`);
+      }
+      // #2604: surface the configured Inference (provider/model) and
+      // Connected (active-session count) as labeled fields. Bare
+      // `nemoclaw status` previously only had the model in parens above —
+      // users had to run `nemoclaw <name> status` to see provider and
+      // connection state.
+      if (provider || model) {
+        const parts = [provider, model].filter(Boolean).join(" / ");
+        log(`      Inference: ${parts}`);
+      }
+      if (deps.getActiveSessionCount) {
+        const count = deps.getActiveSessionCount(sb.name);
+        if (count !== null) {
+          log(
+            `      Connected: ${count > 0 ? `yes (${count} session${count > 1 ? "s" : ""})` : "no"}`,
+          );
+        }
       }
     }
     log("");
@@ -433,7 +464,7 @@ export function showStatusCommand(deps: ShowStatusCommandDeps): void {
     }
   }
 
-  deps.showServiceStatus({ sandboxName: defaultSandbox || undefined });
+  deps.showServiceStatus({ sandboxName: resolvedDefault || undefined });
 
   if (deps.backfillAndFindOverlaps) {
     const overlaps = deps.backfillAndFindOverlaps();
@@ -454,15 +485,15 @@ export function showStatusCommand(deps: ShowStatusCommandDeps): void {
     }
   }
 
-  if (deps.checkMessagingBridgeHealth && defaultSandbox) {
+  if (deps.checkMessagingBridgeHealth && resolvedDefault) {
     // Re-fetch: backfillAndFindOverlaps above may have populated
     // messagingChannels for the default sandbox on first run after upgrade,
     // and the original `sandboxes` snapshot is stale.
     const refreshed = deps.listSandboxes().sandboxes;
-    const defaultEntry = refreshed.find((sb) => sb.name === defaultSandbox);
+    const defaultEntry = refreshed.find((sb) => sb.name === resolvedDefault);
     const channels = defaultEntry?.messagingChannels;
     if (Array.isArray(channels) && channels.length > 0) {
-      const degraded = deps.checkMessagingBridgeHealth(defaultSandbox, channels);
+      const degraded = deps.checkMessagingBridgeHealth(resolvedDefault, channels);
       if (degraded.length > 0) {
         log("");
         for (const { channel, conflicts } of degraded) {
@@ -471,12 +502,12 @@ export function showStatusCommand(deps: ShowStatusCommandDeps): void {
           );
         }
         log(
-          "    Another sandbox is likely polling with the same bot token. See docs/reference/troubleshooting.md.",
+          "    Another sandbox is likely polling with the same bot token. See docs/reference/troubleshooting.mdx.",
         );
 
         // Surface gateway log tail for Hermes sandboxes when messaging is degraded.
         if (deps.readGatewayLog && defaultEntry?.agent === "hermes") {
-          const logTail = deps.readGatewayLog(defaultSandbox);
+          const logTail = deps.readGatewayLog(resolvedDefault);
           if (logTail) {
             log("");
             log("  Messaging gateway log (last 10 lines):");

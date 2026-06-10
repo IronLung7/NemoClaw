@@ -11,7 +11,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import type { CurlProbeResult } from "../adapters/http/probe";
+import type { CurlProbeOptions, CurlProbeResult } from "../adapters/http/probe";
 import { runCurlProbe } from "../adapters/http/probe";
 import { normalizeCredentialValue, resolveProviderCredential } from "../credentials/store";
 import { getProviderSelectionConfig } from "./config";
@@ -26,11 +26,23 @@ export interface ProviderHealthStatus {
   providerLabel: string;
   endpoint: string;
   detail: string;
-  failureLabel?: "unreachable" | "unhealthy";
+  failureLabel?: "unreachable" | "unhealthy" | "unauthorized";
+  /**
+   * Short qualifier rendered as `Inference (<probeLabel>):` so multi-hop
+   * health (e.g. ollama backend vs. auth proxy) surfaces in the status
+   * line. Absent for providers with a single hop. (#3265)
+   */
+  probeLabel?: string;
+  /**
+   * Additional probes that share the same Inference rendering. Used to
+   * surface the Ollama auth-proxy hop alongside the backend probe so a
+   * 401/unreachable proxy doesn't get hidden behind a healthy backend. (#3265)
+   */
+  subprobes?: ProviderHealthStatus[];
 }
 
 export interface ProviderHealthProbeOptions {
-  runCurlProbeImpl?: (argv: string[]) => CurlProbeResult;
+  runCurlProbeImpl?: (argv: string[], opts?: CurlProbeOptions) => CurlProbeResult;
   model?: string | null;
   getCredentialImpl?: (envName: string) => string | null | undefined;
   isWsl?: boolean;
@@ -233,6 +245,7 @@ function probeNvidiaKimiK26Health(
     try {
       return runCurlProbeImpl(
         buildKimiStatusProbeCurlArgs(model, endpoint, authConfigPath, options.isWsl),
+        { trustedConfigFiles: [authConfigPath] },
       );
     } finally {
       cleanupAuthCurlConfig(authConfigPath);
@@ -314,14 +327,24 @@ export function probeProviderHealth(
   };
   const local = probeLocalProviderHealth(provider, localOptions);
   if (local) {
-    return {
-      ok: local.ok,
-      probed: true,
-      providerLabel: local.providerLabel,
-      endpoint: local.endpoint,
-      detail: local.detail,
-    };
+    return localToProviderHealth(local);
   }
 
   return probeRemoteProviderHealth(provider, options);
+}
+
+function localToProviderHealth(
+  local: import("./local").LocalProviderHealthStatus,
+): ProviderHealthStatus {
+  const subprobes = (local.subprobes ?? []).map(localToProviderHealth);
+  return {
+    ok: local.ok,
+    probed: true,
+    providerLabel: local.providerLabel,
+    endpoint: local.endpoint,
+    detail: local.detail,
+    ...(local.failureLabel ? { failureLabel: local.failureLabel } : {}),
+    ...(local.probeLabel ? { probeLabel: local.probeLabel } : {}),
+    ...(subprobes.length > 0 ? { subprobes } : {}),
+  };
 }

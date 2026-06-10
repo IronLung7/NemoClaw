@@ -14,6 +14,17 @@ export interface PlatformHints {
   port?: number;
   isWsl?: boolean;
   wslHostAddress?: string | null;
+  dashboardHealthEndpoint?: string;
+  gatewayPort?: number;
+  gatewayHealthEndpoint?: string;
+  /**
+   * Explicit operator opt-in to bind the dashboard forward on all interfaces.
+   * Only `"0.0.0.0"` enables remote bind; anything else (including
+   * `"127.0.0.1"`, empty string, or arbitrary IPs) leaves the default
+   * loopback bind in place. Surfaces through `NEMOCLAW_DASHBOARD_BIND` at the
+   * I/O boundary (`dashboard-access.ts`). (#3259)
+   */
+  bindOverride?: string;
 }
 
 export interface DashboardDeliveryChain {
@@ -21,6 +32,9 @@ export interface DashboardDeliveryChain {
   corsOrigins: string[];
   forwardTarget: string;
   healthEndpoint: string;
+  dashboardHealthEndpoint: string;
+  gatewayPort: number;
+  gatewayHealthEndpoint: string;
   port: number;
   bindAddress: string;
   shouldDisableDeviceAuth: boolean;
@@ -52,6 +66,21 @@ function isLoopbackUrl(chatUiUrl: string): boolean {
   }
 }
 
+function normalizeEndpointPath(value: string | undefined, fallback: string): string {
+  const raw = String(value || "").trim();
+  if (!raw) return fallback;
+  if (raw.startsWith("/")) return raw;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) {
+    try {
+      const path = new URL(raw).pathname;
+      if (path) return path;
+    } catch {
+      // Treat malformed URL-like values as path fragments below.
+    }
+  }
+  return `/${raw}`;
+}
+
 /** Build the complete dashboard delivery chain from platform hints. */
 export function buildChain(hints?: PlatformHints): DashboardDeliveryChain {
   const h = hints || {};
@@ -69,16 +98,38 @@ export function buildChain(hints?: PlatformHints): DashboardDeliveryChain {
     accessUrl = `http://127.0.0.1:${port}`;
   }
 
-  const forwardTarget = h.isWsl || hasNonLoopbackUrl ? `0.0.0.0:${port}` : String(port);
+  // #3259 — operator opt-in via NEMOCLAW_DASHBOARD_BIND=0.0.0.0 for remote-SSH-deployed
+  // hosts (Brev, cloud workstations). Only "0.0.0.0" is honored; arbitrary IPs are
+  // rejected silently to keep the surface narrow.
+  const remoteBindOptIn = h.bindOverride === "0.0.0.0";
+  const forwardTarget =
+    h.isWsl || hasNonLoopbackUrl || remoteBindOptIn ? `0.0.0.0:${port}` : String(port);
   const bindAddress = forwardTarget.includes(":") ? "0.0.0.0" : "127.0.0.1";
   const loopbackOrigin = `http://127.0.0.1:${port}`;
   const accessOrigin = (() => { try { return new URL(accessUrl).origin; } catch { return null; } })();
   const corsOrigins = accessOrigin && accessOrigin !== loopbackOrigin
     ? [loopbackOrigin, accessOrigin] : [loopbackOrigin];
 
-  const shouldDisableDeviceAuth = hasNonLoopbackUrl || (h.isWsl ?? false);
+  const shouldDisableDeviceAuth = hasNonLoopbackUrl || (h.isWsl ?? false) || remoteBindOptIn;
+  const dashboardHealthEndpoint = normalizeEndpointPath(h.dashboardHealthEndpoint, "/health");
+  const gatewayPort =
+    Number.isFinite(h.gatewayPort) && h.gatewayPort! >= 1 && h.gatewayPort! <= 65535
+      ? Number(h.gatewayPort)
+      : port;
+  const gatewayHealthEndpoint = normalizeEndpointPath(h.gatewayHealthEndpoint, dashboardHealthEndpoint);
 
-  return { accessUrl, corsOrigins, forwardTarget, healthEndpoint: "/health", port, bindAddress, shouldDisableDeviceAuth };
+  return {
+    accessUrl,
+    corsOrigins,
+    forwardTarget,
+    healthEndpoint: dashboardHealthEndpoint,
+    dashboardHealthEndpoint,
+    gatewayPort,
+    gatewayHealthEndpoint,
+    port,
+    bindAddress,
+    shouldDisableDeviceAuth,
+  };
 }
 
 /** Build the list of control UI URLs. Callers pass chatUiUrl explicitly. */

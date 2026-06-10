@@ -8,7 +8,6 @@
 // can be passed through to `openshell provider create/update --credential KEY`
 // during onboarding. Nothing is written to disk.
 
-import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -20,6 +19,11 @@ import { rejectSymlinksOnPath } from "../state/config-io";
 const UNSAFE_HOME_PATHS = new Set(["/tmp", "/var/tmp", "/dev/shm", "/"]);
 
 type CredentialInput = string | null | undefined;
+export type CredentialPromptIntent =
+  | { kind: "credential"; value: string }
+  | { kind: "back" }
+  | { kind: "exit" }
+  | { kind: "help" };
 
 // Credential env keys NemoClaw knows how to round-trip. listCredentialKeys()
 // projects the in-process env through this set; entries not in the set are
@@ -42,6 +46,7 @@ export const KNOWN_CREDENTIAL_ENV_KEYS: readonly string[] = [
   "DISCORD_BOT_TOKEN",
   "SLACK_BOT_TOKEN",
   "SLACK_APP_TOKEN",
+  "WECHAT_BOT_TOKEN",
 ];
 
 // Hard upper bound on the legacy credentials.json size we are willing to
@@ -50,6 +55,23 @@ export const KNOWN_CREDENTIAL_ENV_KEYS: readonly string[] = [
 // can write to ~/.nemoclaw/ cannot OOM the next onboard by planting a
 // huge file. 1 MiB leaves plenty of headroom over any plausible mutation.
 const LEGACY_CREDS_FILE_MAX_BYTES = 1 * 1024 * 1024;
+
+function noFollowFlag(): number | undefined {
+  return typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : undefined;
+}
+
+function openReadOnlyNoFollow(filePath: string): number {
+  const flag = noFollowFlag();
+  if (flag === undefined) {
+    const stat = fs.lstatSync(filePath);
+    if (stat.isSymbolicLink()) {
+      const error = new Error(`Refusing to follow symlink: ${filePath}`) as NodeJS.ErrnoException;
+      error.code = "ELOOP";
+      throw error;
+    }
+  }
+  return fs.openSync(filePath, fs.constants.O_RDONLY | (flag ?? 0));
+}
 
 /**
  * Resolve the user's home directory and reject obviously unsafe choices
@@ -126,6 +148,15 @@ export function normalizeCredentialValue(value: CredentialInput): string {
   return value.replace(/\r/g, "").trim();
 }
 
+export function getCredentialPromptIntent(value: CredentialInput): CredentialPromptIntent {
+  const normalized = normalizeCredentialValue(value);
+  const navigation = normalized.toLowerCase();
+  if (navigation === "back") return { kind: "back" };
+  if (navigation === "exit" || navigation === "quit") return { kind: "exit" };
+  if (navigation === "?" || navigation === "help") return { kind: "help" };
+  return { kind: "credential", value: normalized };
+}
+
 /**
  * Stage a credential for the current process. The OpenShell upsert that
  * follows in onboarding (`openshell provider create/update --credential KEY`)
@@ -134,7 +165,7 @@ export function normalizeCredentialValue(value: CredentialInput): string {
  *
  * NOTE for tests: this mutates `process.env` directly (not via vitest's
  * `vi.stubEnv`), so callers that pollute the env in a unit test must
- * clean up themselves — see `test/credentials.test.ts` for the
+ * clean up themselves — see the credentials tests for the
  * `clearTrackedEnv` pattern.
  */
 export function saveCredential(key: string, value: CredentialInput): void {
@@ -221,18 +252,20 @@ export function listCredentialKeys(): string[] {
  * backup tools and same-user processes tend to read.
  */
 function secureUnlink(filePath: string): void {
+  let opened = false;
   try {
-    const stat = fs.lstatSync(filePath);
-    if (stat.isSymbolicLink()) {
-      // The credentials path was a symlink; remove the link itself without
-      // touching whatever it pointed at.
-      fs.unlinkSync(filePath);
+    const flag = noFollowFlag();
+    if (flag === undefined) {
+      const stat = fs.lstatSync(filePath);
+      if (stat.isFile() || stat.isSymbolicLink()) fs.unlinkSync(filePath);
       return;
     }
-    if (!stat.isFile()) return;
-    if (stat.size > 0) {
-      const fd = fs.openSync(filePath, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW);
-      try {
+    const fd = fs.openSync(filePath, fs.constants.O_RDWR | flag);
+    opened = true;
+    try {
+      const stat = fs.fstatSync(fd);
+      if (!stat.isFile()) return;
+      if (stat.size > 0) {
         const chunkSize = Math.min(stat.size, 64 * 1024);
         const zeros = Buffer.alloc(chunkSize);
         let written = 0;
@@ -242,15 +275,18 @@ function secureUnlink(filePath: string): void {
           written += len;
         }
         fs.fsyncSync(fd);
-      } finally {
-        fs.closeSync(fd);
       }
+    } finally {
+      fs.closeSync(fd);
     }
   } catch {
-    // best effort
+    // best effort; a final-component symlink either fails O_NOFOLLOW or is
+    // handled by the no-O_NOFOLLOW lstat fallback without touching its target.
   }
   try {
-    fs.unlinkSync(filePath);
+    if (opened || fs.lstatSync(filePath).isSymbolicLink()) {
+      fs.unlinkSync(filePath);
+    }
   } catch {
     // best effort
   }
@@ -296,7 +332,7 @@ export function stageLegacyCredentialsToEnv(): string[] {
   // symlink planted at the credentials path.
   let fd: number;
   try {
-    fd = fs.openSync(legacyFile, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    fd = openReadOnlyNoFollow(legacyFile);
   } catch {
     return [];
   }
@@ -407,7 +443,7 @@ export function removeLegacyCredentialsFileIfEmpty(): boolean {
 
   let fd: number;
   try {
-    fd = fs.openSync(legacyFile, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    fd = openReadOnlyNoFollow(legacyFile);
   } catch {
     return false;
   }
@@ -643,17 +679,24 @@ export function prompt(question: string, opts: { secret?: boolean } = {}): Promi
   });
 }
 
+export async function readCredentialPrompt(
+  question: string,
+  promptImpl: typeof prompt = prompt,
+): Promise<CredentialPromptIntent> {
+  return getCredentialPromptIntent(await promptImpl(question, { secret: true }));
+}
+
 /**
  * Ensure `NVIDIA_API_KEY` is staged for this process. Returns immediately
  * if it is already in env, otherwise prompts interactively (validating
  * the `nvapi-` prefix) and stages the result. Onboarding registers the
  * value with the OpenShell gateway later in the flow.
  */
-export async function ensureApiKey(): Promise<void> {
+export async function ensureApiKey(): Promise<CredentialPromptIntent> {
   let key = getCredential("NVIDIA_API_KEY");
   if (key) {
     process.env.NVIDIA_API_KEY = key;
-    return;
+    return { kind: "credential", value: key };
   }
 
   console.log("");
@@ -668,7 +711,13 @@ export async function ensureApiKey(): Promise<void> {
   console.log("");
 
   while (true) {
-    key = normalizeCredentialValue(await prompt("  NVIDIA API Key: ", { secret: true }));
+    const input = getCredentialPromptIntent(await prompt("  NVIDIA API Key: ", { secret: true }));
+    if (input.kind === "help") {
+      console.log("  Type back to choose a different provider, or exit to quit.");
+      continue;
+    }
+    if (input.kind !== "credential") return input;
+    key = input.value;
 
     if (!key) {
       console.error("  NVIDIA API Key is required.");
@@ -689,78 +738,5 @@ export async function ensureApiKey(): Promise<void> {
   console.log("  Key staged for the OpenShell gateway. It is held in process memory only;");
   console.log("  onboarding registers it with the gateway and nothing is written to disk.");
   console.log("");
-}
-
-/**
- * Return true if `<owner>/<name>` is a private GitHub repository, using
- * `gh api`. Returns false on any failure (no `gh`, not authenticated,
- * network error) — callers must treat the result as a hint, not a proof.
- */
-export function isRepoPrivate(repo: string): boolean {
-  try {
-    const json = execFileSync("gh", ["api", `repos/${repo}`, "--jq", ".private"], {
-      encoding: "utf-8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-    return json === "true";
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Ensure `GITHUB_TOKEN` is staged for this process when a private repo
- * needs it. Tries `gh auth token` first (which returns whatever the
- * GitHub CLI has stored — system keychain when reachable, otherwise a
- * gh-managed file); falls back to a session-only PAT prompt if `gh` is
- * unavailable or not logged in. The token is never persisted to host
- * disk by NemoClaw itself.
- */
-export async function ensureGithubToken(): Promise<void> {
-  let token = getCredential("GITHUB_TOKEN");
-  if (token) {
-    process.env.GITHUB_TOKEN = token;
-    return;
-  }
-
-  // Preferred path: gh CLI keeps tokens in the OS keychain.
-  try {
-    token = execFileSync("gh", ["auth", "token"], {
-      encoding: "utf-8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-    if (token) {
-      process.env.GITHUB_TOKEN = token;
-      return;
-    }
-  } catch {
-    /* gh not available or not logged in */
-  }
-
-  console.log("");
-  console.log("  ┌────────────────────────────────────────────────────────────────┐");
-  console.log("  │  GitHub token required (private repo detected)                 │");
-  console.log("  │                                                                │");
-  console.log("  │  Recommended: run 'gh auth login'. NemoClaw picks up whatever  │");
-  console.log("  │  the GitHub CLI stores (system keychain when reachable; a      │");
-  console.log("  │  gh-managed file otherwise).                                   │");
-  console.log("  │                                                                │");
-  console.log("  │  Otherwise, paste a PAT below for this run only.               │");
-  console.log("  └────────────────────────────────────────────────────────────────┘");
-  console.log("");
-
-  token = await prompt("  GitHub Token: ", { secret: true });
-
-  if (!token) {
-    console.error("  Token required for deploy (repo is private).");
-    process.exit(1);
-  }
-
-  saveCredential("GITHUB_TOKEN", token);
-  process.env.GITHUB_TOKEN = token;
-  console.log("");
-  console.log("  Token loaded for this session only. Run 'gh auth login' to let");
-  console.log("  the GitHub CLI persist it (system keychain when reachable;");
-  console.log("  gh-managed file otherwise) so future runs do not prompt.");
-  console.log("");
+  return { kind: "credential", value: key };
 }

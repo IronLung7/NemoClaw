@@ -10,10 +10,47 @@
 // Credentials must never be baked into sandbox filesystems or local backups.
 // They are injected at runtime via OpenShell's provider credential mechanism.
 
-import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, dirname, join } from "node:path";
 
 function parseJson<T>(text: string): T {
   return JSON.parse(text);
+}
+
+function readRegularFileNoFollow(filePath: string): string | null {
+  let fd: number;
+  try {
+    if (typeof constants.O_NOFOLLOW !== "number") {
+      const stat = lstatSync(filePath);
+      if (!stat.isFile() || stat.isSymbolicLink()) return null;
+    }
+    const noFollowFlag = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+    fd = openSync(filePath, constants.O_RDONLY | noFollowFlag);
+  } catch {
+    return null;
+  }
+  try {
+    if (!fstatSync(fd).isFile()) return null;
+    return String(readFileSync(fd, "utf-8"));
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function writeFileAtomically(filePath: string, contents: string): void {
+  const tmpPath = join(dirname(filePath), `.${basename(filePath)}.${process.pid}.${randomUUID()}.tmp`);
+  writeFileSync(tmpPath, contents, { mode: 0o600 });
+  renameSync(tmpPath, filePath);
 }
 
 /**
@@ -40,6 +77,20 @@ const CREDENTIAL_PLACEHOLDER = "[STRIPPED_BY_MIGRATION]";
  * excluded from backups entirely.
  */
 export const CREDENTIAL_SENSITIVE_BASENAMES = new Set(["auth-profiles.json", "auth.json"]);
+
+/**
+ * Dependency lockfiles may contain package metadata that resembles credentials
+ * (for example package names or tarball URLs with `sk-` substrings). They do
+ * not store NemoClaw runtime credentials and should not fail snapshot leak
+ * checks.
+ */
+const SNAPSHOT_CREDENTIAL_SCAN_EXCLUDED_BASENAMES = new Set([
+  "package-lock.json",
+  "npm-shrinkwrap.json",
+  "yarn.lock",
+  "pnpm-lock.yaml",
+  "pnpm-lock.yml",
+]);
 
 /**
  * Credential field names that MUST be stripped from config files.
@@ -130,10 +181,11 @@ export function stripCredentials(obj: ConfigValue): ConfigValue {
  * Removes the "gateway" section (contains auth tokens — regenerated at startup).
  */
 export function sanitizeConfigFile(configPath: string): void {
-  if (!existsSync(configPath)) return;
+  const rawConfig = readRegularFileNoFollow(configPath);
+  if (rawConfig === null) return;
   let parsed: ConfigValue;
   try {
-    parsed = parseJson<ConfigValue>(readFileSync(configPath, "utf-8"));
+    parsed = parseJson<ConfigValue>(rawConfig);
   } catch {
     return; // Not valid JSON — skip (may be YAML for Hermes)
   }
@@ -141,8 +193,7 @@ export function sanitizeConfigFile(configPath: string): void {
 
   const { gateway: _gateway, ...config } = parsed;
   const sanitized = stripCredentials(config);
-  writeFileSync(configPath, JSON.stringify(sanitized, null, 2));
-  chmodSync(configPath, 0o600);
+  writeFileAtomically(configPath, JSON.stringify(sanitized, null, 2));
 }
 
 /**
@@ -150,4 +201,14 @@ export function sanitizeConfigFile(configPath: string): void {
  */
 export function isSensitiveFile(filename: string): boolean {
   return CREDENTIAL_SENSITIVE_BASENAMES.has(filename.toLowerCase());
+}
+
+/**
+ * Return whether a snapshot file should be scanned for credential-looking
+ * payloads by coarse-grained E2E leak checks.
+ */
+export function shouldScanSnapshotFileForCredentials(filename: string): boolean {
+  const normalizedBasename = basename(filename).toLowerCase();
+  if (SNAPSHOT_CREDENTIAL_SCAN_EXCLUDED_BASENAMES.has(normalizedBasename)) return false;
+  return normalizedBasename === ".env" || normalizedBasename.endsWith(".env") || normalizedBasename.endsWith(".json");
 }

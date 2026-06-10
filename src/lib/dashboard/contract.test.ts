@@ -10,6 +10,7 @@ describe("buildChain", () => {
     expect(c).toMatchObject({
       accessUrl: "http://127.0.0.1:18789", forwardTarget: "18789",
       healthEndpoint: "/health", port: 18789, bindAddress: "127.0.0.1",
+      dashboardHealthEndpoint: "/health", gatewayPort: 18789, gatewayHealthEndpoint: "/health",
     });
     expect(c.corsOrigins).toEqual(["http://127.0.0.1:18789"]);
     expect(c.shouldDisableDeviceAuth).toBe(false);
@@ -42,6 +43,25 @@ describe("buildChain", () => {
     expect(buildChain({ port: 19000 }).port).toBe(19000);
   });
 
+  it("supports separate agent dashboard and gateway health probes", () => {
+    const c = buildChain({
+      chatUiUrl: "http://127.0.0.1:18789",
+      dashboardHealthEndpoint: "api/status",
+      gatewayPort: 8642,
+      gatewayHealthEndpoint: "/health",
+    });
+    expect(c.port).toBe(18789);
+    expect(c.dashboardHealthEndpoint).toBe("/api/status");
+    expect(c.healthEndpoint).toBe("/api/status");
+    expect(c.gatewayPort).toBe(8642);
+    expect(c.gatewayHealthEndpoint).toBe("/health");
+  });
+
+  it("normalizes URL-shaped health endpoints to their pathname", () => {
+    expect(buildChain({ dashboardHealthEndpoint: "http://127.0.0.1/" }).dashboardHealthEndpoint).toBe("/");
+    expect(buildChain({ gatewayHealthEndpoint: "http://127.0.0.1/health" }).gatewayHealthEndpoint).toBe("/health");
+  });
+
   it("treats empty/invalid chatUiUrl as default without throwing", () => {
     expect(buildChain({ chatUiUrl: "" }).port).toBe(18789);
     expect(buildChain({ chatUiUrl: "not-a-url" }).port).toBe(18789);
@@ -65,6 +85,34 @@ describe("buildChain", () => {
 
   it("shouldDisableDeviceAuth is false for IPv6 loopback", () => {
     expect(buildChain({ chatUiUrl: "http://[::1]:18789" }).shouldDisableDeviceAuth).toBe(false);
+  });
+
+  // #3259 — explicit operator opt-in to bind dashboard on all interfaces
+  // for remote-SSH-deployed hosts (Brev / cloud workstations).
+  it("binds to 0.0.0.0 when bindOverride='0.0.0.0' is set, even for loopback URL", () => {
+    const c = buildChain({ chatUiUrl: "http://127.0.0.1:18789", bindOverride: "0.0.0.0" });
+    expect(c.forwardTarget).toBe("0.0.0.0:18789");
+    expect(c.bindAddress).toBe("0.0.0.0");
+  });
+
+  it("does not bind to 0.0.0.0 when bindOverride is empty/loopback", () => {
+    const c1 = buildChain({ chatUiUrl: "http://127.0.0.1:18789", bindOverride: "" });
+    expect(c1.forwardTarget).toBe("18789");
+    expect(c1.bindAddress).toBe("127.0.0.1");
+    const c2 = buildChain({ chatUiUrl: "http://127.0.0.1:18789", bindOverride: "127.0.0.1" });
+    expect(c2.forwardTarget).toBe("18789");
+    expect(c2.bindAddress).toBe("127.0.0.1");
+  });
+
+  it("ignores invalid bindOverride values (security: only 0.0.0.0 / 127.0.0.1 accepted)", () => {
+    const c = buildChain({ chatUiUrl: "http://127.0.0.1:18789", bindOverride: "10.0.0.5" });
+    expect(c.forwardTarget).toBe("18789");
+    expect(c.bindAddress).toBe("127.0.0.1");
+  });
+
+  it("disables device auth when bindOverride='0.0.0.0' (cross-host access opted in)", () => {
+    const c = buildChain({ chatUiUrl: "http://127.0.0.1:18789", bindOverride: "0.0.0.0" });
+    expect(c.shouldDisableDeviceAuth).toBe(true);
   });
 });
 

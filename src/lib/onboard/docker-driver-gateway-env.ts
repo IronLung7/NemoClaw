@@ -13,8 +13,14 @@ import {
   getGatewayHttpsEndpoint,
 } from "../core/gateway-address";
 import { GATEWAY_PORT } from "../core/ports";
+import {
+  hasOpenShellGatewayUserService,
+  startPackageManagedDockerDriverGateway,
+  type PackageManagedDockerDriverGatewayOptions,
+} from "./docker-driver-gateway-service";
 
 export { getGatewayHttpsEndpoint };
+export { startPackageManagedDockerDriverGateway };
 
 export const DOCKER_DRIVER_GATEWAY_RUNTIME_ENV_KEYS = [
   "OPENSHELL_DRIVERS",
@@ -29,6 +35,8 @@ export const DOCKER_DRIVER_GATEWAY_RUNTIME_ENV_KEYS = [
   "OPENSHELL_DOCKER_NETWORK_NAME",
   "OPENSHELL_DOCKER_SUPERVISOR_IMAGE",
   "OPENSHELL_DOCKER_SUPERVISOR_BIN",
+  "OPENSHELL_VM_DRIVER_STATE_DIR",
+  "OPENSHELL_DRIVER_DIR",
 ] as const;
 
 export interface BuildDockerDriverGatewayEnvOptions {
@@ -36,9 +44,15 @@ export interface BuildDockerDriverGatewayEnvOptions {
   stateDir: string;
   dockerNetworkName?: string;
   getDockerSupervisorImage: () => string;
-  resolveVmDriverBin: () => string | null;
   resolveSandboxBin: () => string | null;
 }
+
+export type PackageManagedDockerDriverGatewayWithEnvOverrideOptions = Omit<
+  PackageManagedDockerDriverGatewayOptions,
+  "prepareOpenShellGatewayUserServiceEnv"
+> & {
+  gatewayEnv: Record<string, string>;
+};
 
 export function getGatewayPortCheckOptions(): { host: string } {
   return { host: GATEWAY_BIND_ADDRESS };
@@ -69,29 +83,19 @@ export function buildDockerDriverGatewayEnv({
   stateDir,
   dockerNetworkName = "openshell-docker",
   getDockerSupervisorImage,
-  resolveVmDriverBin,
   resolveSandboxBin,
 }: BuildDockerDriverGatewayEnvOptions): Record<string, string> {
   const env: Record<string, string> = {
-    OPENSHELL_DRIVERS: platform === "darwin" ? "vm" : "docker",
+    OPENSHELL_DRIVERS: "docker",
     ...getGatewayStartNetworkEnv(),
     OPENSHELL_DISABLE_TLS: "true",
     OPENSHELL_DISABLE_GATEWAY_AUTH: "true",
     OPENSHELL_DB_URL: `sqlite:${path.join(stateDir, "openshell.db")}`,
-    OPENSHELL_GRPC_ENDPOINT:
-      platform === "darwin"
-        ? `http://host.containers.internal:${GATEWAY_PORT}`
-        : getDockerDriverGatewayEndpoint(),
+    OPENSHELL_GRPC_ENDPOINT: getDockerDriverGatewayEndpoint(),
+    OPENSHELL_DOCKER_NETWORK_NAME: dockerNetworkName,
+    OPENSHELL_DOCKER_SUPERVISOR_IMAGE: getDockerSupervisorImage(),
   };
-  if (platform === "darwin") {
-    env.OPENSHELL_VM_DRIVER_STATE_DIR = path.join(stateDir, "vm-driver");
-    const vmDriverBin = resolveVmDriverBin();
-    if (vmDriverBin) {
-      env.OPENSHELL_DRIVER_DIR = path.dirname(vmDriverBin);
-    }
-  } else {
-    env.OPENSHELL_DOCKER_NETWORK_NAME = dockerNetworkName;
-    env.OPENSHELL_DOCKER_SUPERVISOR_IMAGE = getDockerSupervisorImage();
+  if (platform === "linux") {
     const sandboxBin = resolveSandboxBin();
     if (sandboxBin) {
       env.OPENSHELL_DOCKER_SUPERVISOR_BIN = sandboxBin;
@@ -140,15 +144,7 @@ function readTextFileIfPresent(filePath: string): string {
   }
 }
 
-export function writeDockerGatewayDebEnvOverride(
-  getOverride: () => Record<string, string>,
-): void {
-  const servicePaths = [
-    "/usr/bin/openshell-gateway",
-    "/usr/lib/systemd/user/openshell-gateway.service",
-    "/lib/systemd/user/openshell-gateway.service",
-  ];
-  if (!servicePaths.some((candidate) => fs.existsSync(candidate))) return;
+function writeDockerGatewayDebEnvOverrideFile(getOverride: () => Record<string, string>): void {
   const override = getOverride();
   const envDir = path.join(os.homedir(), ".config", "openshell");
   const envFile = path.join(envDir, "gateway.env");
@@ -160,4 +156,33 @@ export function writeDockerGatewayDebEnvOverride(
     mode: 0o600,
   });
   fs.chmodSync(envFile, 0o600);
+}
+
+export function writeDockerGatewayDebEnvOverride(
+  getOverride: () => Record<string, string>,
+  opts: Parameters<typeof hasOpenShellGatewayUserService>[0] = {},
+): boolean {
+  if (!hasOpenShellGatewayUserService(opts)) return false;
+  writeDockerGatewayDebEnvOverrideFile(getOverride);
+  return true;
+}
+
+export function writeDockerGatewayDebEnvOverrideOrThrow(
+  getOverride: () => Record<string, string>,
+  opts: Parameters<typeof hasOpenShellGatewayUserService>[0] = {},
+): void {
+  if (!writeDockerGatewayDebEnvOverride(getOverride, opts)) {
+    throw new Error("OpenShell gateway user service env file is not available");
+  }
+}
+
+export function startPackageManagedDockerDriverGatewayWithEnvOverride({
+  gatewayEnv,
+  ...options
+}: PackageManagedDockerDriverGatewayWithEnvOverrideOptions): Promise<boolean> {
+  return startPackageManagedDockerDriverGateway({
+    ...options,
+    prepareOpenShellGatewayUserServiceEnv: () =>
+      writeDockerGatewayDebEnvOverrideFile(() => gatewayEnv),
+  });
 }

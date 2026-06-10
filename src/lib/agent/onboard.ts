@@ -10,17 +10,19 @@ import os from "os";
 import path from "path";
 
 import { dockerBuild, dockerImageInspect } from "../adapters/docker";
+import { buildValidatedCurlCommandArgs } from "../adapters/http/curl-args";
 import { getAgentBranding } from "../cli/branding";
+import type { JsonObject as LooseObject } from "../core/json-types";
+import { sleepSeconds } from "../core/wait";
 import { getProviderSelectionConfig } from "../inference/config";
-import type { JsonObject as LooseObject, JsonValue as LooseValue } from "../core/json-types";
-import * as onboardSession from "../state/onboard-session";
+import { runSandboxConfigSync } from "../onboard/config-sync";
 import { ROOT, redact, run, shellQuote } from "../runner";
 import {
   buildLocalBaseTag,
   resolveSandboxBaseImage,
   SANDBOX_BASE_TAG,
 } from "../sandbox-base-image";
-import { sleepSeconds } from "../core/wait";
+import { printOptionalDashboardUi } from "./dashboard-ui";
 import { type AgentDefinition, loadAgent, resolveAgentName } from "./defs";
 
 export interface OnboardContext {
@@ -28,10 +30,9 @@ export interface OnboardContext {
   runCaptureOpenshell: (args: string[], opts?: { ignoreError?: boolean }) => string | null;
   openshellShellCommand: (args: string[], options?: { openshellBinary?: string }) => string;
   openshellBinary: string;
-  buildSandboxConfigSyncScript: (config: LooseObject) => string;
-  writeSandboxConfigSyncFile: (script: string) => string;
-  cleanupTempDir: (file: string, prefix: string) => void;
-  startRecordedStep: (stepName: string, updates: LooseObject) => void;
+  startRecordedStep: (stepName: string, updates: LooseObject) => Promise<void>;
+  recordStepComplete: (stepName: string, updates: LooseObject) => Promise<unknown>;
+  recordStepFailed: (stepName: string, message: string | null) => Promise<unknown>;
   skippedStepMessage: (stepName: string, sandboxName: string) => void;
 }
 
@@ -178,13 +179,6 @@ export function getAgentPolicyPath(agent: AgentDefinition): string | null {
 }
 
 /**
- * Get the agent-specific permissive policy path, or null to use the global fallback.
- */
-export function getAgentPermissivePolicyPath(agent: AgentDefinition): string | null {
-  return agent.policyPermissivePath || null;
-}
-
-/**
  * Sleep for the requested number of seconds using the shared wait helper.
  */
 function sleep(seconds: number): void {
@@ -216,6 +210,42 @@ type AgentBinaryAvailability =
     };
 
 const AGENT_BINARY_CHECK_PREFIX = "NEMOCLAW_AGENT_BINARY_CHECK:";
+const HERMES_TIRITH_MARKER_ABSENT = "tirith marker: absent";
+const HERMES_STARTUP_DIAGNOSTICS_SCRIPT = `
+set +e
+marker=/sandbox/.hermes/.tirith-install-failed
+if [ ! -e "$marker" ]; then
+  echo "${HERMES_TIRITH_MARKER_ABSENT}"
+  exit 0
+fi
+if [ -L "$marker" ]; then
+  echo "tirith marker: symlink (not read)"
+else
+  printf "tirith marker: "
+  head -c 200 "$marker" 2>/dev/null || printf "unreadable"
+  printf "\\n"
+fi
+
+tirith=/sandbox/.hermes/bin/tirith
+if [ -x "$tirith" ] && [ ! -L "$tirith" ]; then
+  echo "tirith binary: present executable ($tirith)"
+elif [ -e "$tirith" ]; then
+  echo "tirith binary: present but not executable ($tirith)"
+else
+  echo "tirith binary: missing ($tirith)"
+fi
+
+for log in /tmp/nemoclaw-start.log /tmp/gateway.log; do
+  if [ -f "$log" ] && [ ! -L "$log" ]; then
+    echo "--- tail: $log ---"
+    tail -n 40 "$log" 2>/dev/null || echo "(tail unavailable)"
+  elif [ -L "$log" ]; then
+    echo "--- tail: $log skipped (symlink) ---"
+  else
+    echo "--- tail: $log unavailable ---"
+  fi
+done
+`.trim();
 
 /**
  * Check whether the selected agent binary is available inside the sandbox.
@@ -293,11 +323,49 @@ function describeAgentBinaryFailure(
 }
 
 /**
+ * Collect read-only Hermes startup diagnostics for Step 7 health timeouts.
+ * Returns no extra lines when the Tirith marker is absent so non-Tirith
+ * failures keep the existing terse error shape.
+ */
+export function collectHermesStartupDiagnostics(
+  sandboxName: string,
+  runCaptureOpenshell: OnboardContext["runCaptureOpenshell"],
+): string[] {
+  const output = runCaptureOpenshell(
+    ["sandbox", "exec", "-n", sandboxName, "--", "sh", "-lc", HERMES_STARTUP_DIAGNOSTICS_SCRIPT],
+    { ignoreError: true },
+  );
+  const redactedOutput = String(redact(output ?? ""));
+  const lines = redactedOutput
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter((line) => line.length > 0);
+
+  const markerLine = lines.find((line) => line.startsWith("tirith marker:"));
+  if (!markerLine || markerLine === HERMES_TIRITH_MARKER_ABSENT) {
+    return [];
+  }
+  return ["Hermes startup diagnostics:", ...lines.slice(0, 140)];
+}
+
+/**
  * Record and print an agent setup failure before exiting the onboarding flow.
  */
-function failAgentSetup(sandboxName: string, agent: AgentDefinition, message: string): never {
-  onboardSession.markStepFailed("agent_setup", message);
+async function failAgentSetup(
+  sandboxName: string,
+  agent: AgentDefinition,
+  message: string,
+  recordStepFailed: OnboardContext["recordStepFailed"],
+  details: string[] = [],
+): Promise<never> {
+  await recordStepFailed(
+    "agent_setup",
+    details.length > 0 ? `${message}\n${details.join("\n")}` : message,
+  );
   console.error(`  \u2717 ${message}`);
+  for (const line of details) {
+    console.error(`    ${line}`);
+  }
   console.error(`    Check: ${agentCliName(agent)} ${sandboxName} logs --follow`);
   process.exit(1);
 }
@@ -305,7 +373,7 @@ function failAgentSetup(sandboxName: string, agent: AgentDefinition, message: st
 /**
  * Interpret an agent health-probe response as healthy or unhealthy.
  */
-function isHealthProbeOk(result: string | null | undefined): boolean {
+export function isHealthProbeOk(result: string | null | undefined): boolean {
   const body = (result ?? "").trim();
   if (body === "ok") {
     return true;
@@ -335,61 +403,70 @@ export async function handleAgentSetup(
   const {
     step,
     runCaptureOpenshell,
-    openshellShellCommand,
     openshellBinary: openshellBin,
-    buildSandboxConfigSyncScript,
-    writeSandboxConfigSyncFile,
-    cleanupTempDir,
     startRecordedStep,
+    recordStepComplete,
+    recordStepFailed,
     skippedStepMessage,
   } = ctx;
+
+  const syncNemoClawConfig = (): void => {
+    runSandboxConfigSync(sandboxName, {
+      getSelectionConfig: () => {
+        const cfg = getProviderSelectionConfig(provider, model);
+        return cfg ? { ...cfg, agent: agent.name } : null;
+      },
+      runConnectScript: (name, scriptContent) => {
+        run([openshellBin, "sandbox", "connect", name], {
+          stdio: ["pipe", "ignore", "inherit"],
+          input: scriptContent,
+        });
+      },
+    });
+  };
 
   if (resume && sandboxName) {
     const probe = agent.healthProbe;
     if (probe?.url) {
       const result = runCaptureOpenshell(
-        ["sandbox", "exec", "-n", sandboxName, "--", "curl", "-sf", "--max-time", "3", probe.url],
+        [
+          "sandbox",
+          "exec",
+          "-n",
+          sandboxName,
+          "--",
+          "curl",
+          ...buildValidatedCurlCommandArgs(["-sf", "--max-time", "3", probe.url]),
+        ],
         { ignoreError: true },
       );
       if (isHealthProbeOk(result)) {
         skippedStepMessage("agent_setup", sandboxName);
-        onboardSession.markStepComplete("agent_setup", { sandboxName, provider, model });
+        // Re-sync `~/.nemoclaw/config.json` even on the resume skip path —
+        // a rebuild destroys/recreates the container and the file reverts
+        // to the Dockerfile's zero-byte placeholder. Mirrors the OpenClaw
+        // path in src/lib/onboard.ts. Fixes #3999 for non-OpenClaw agents.
+        syncNemoClawConfig();
+        await recordStepComplete("agent_setup", { sandboxName, provider, model });
         return;
       }
     }
   }
 
-  startRecordedStep("agent_setup", { sandboxName, provider, model });
+  await startRecordedStep("agent_setup", { sandboxName, provider, model });
   step(7, 8, `Setting up ${agent.displayName} inside sandbox`);
 
   const binaryAvailability = verifyAgentBinaryAvailable(sandboxName, agent, runCaptureOpenshell);
   if (!binaryAvailability.available) {
-    failAgentSetup(
+    await failAgentSetup(
       sandboxName,
       agent,
       describeAgentBinaryFailure(sandboxName, agent, binaryAvailability),
+      recordStepFailed,
     );
   }
 
-  const selectionConfig = getProviderSelectionConfig(provider, model);
-  if (selectionConfig) {
-    const sandboxConfig = {
-      ...selectionConfig,
-      agent: agent.name,
-      onboardedAt: new Date().toISOString(),
-    };
-    const script = buildSandboxConfigSyncScript(sandboxConfig);
-    const scriptFile = writeSandboxConfigSyncFile(script);
-    try {
-      const scriptContent = fs.readFileSync(scriptFile, "utf-8");
-      run([openshellBin, "sandbox", "connect", sandboxName], {
-        stdio: ["pipe", "ignore", "inherit"],
-        input: scriptContent,
-      });
-    } finally {
-      cleanupTempDir(scriptFile, "nemoclaw-sync");
-    }
-  }
+  syncNemoClawConfig();
 
   const probe = agent.healthProbe;
   if (probe?.url) {
@@ -400,7 +477,15 @@ export async function handleAgentSetup(
     let healthy = false;
     for (let i = 0; i < maxAttempts; i++) {
       const result = runCaptureOpenshell(
-        ["sandbox", "exec", "-n", sandboxName, "--", "curl", "-sf", "--max-time", "3", probe.url],
+        [
+          "sandbox",
+          "exec",
+          "-n",
+          sandboxName,
+          "--",
+          "curl",
+          ...buildValidatedCurlCommandArgs(["-sf", "--max-time", "3", probe.url]),
+        ],
         { ignoreError: true },
       );
       if (isHealthProbeOk(result)) {
@@ -412,17 +497,23 @@ export async function handleAgentSetup(
     if (healthy) {
       console.log(`  \u2713 ${agent.displayName} gateway is healthy`);
     } else {
-      failAgentSetup(
+      const diagnostics =
+        agent.name === "hermes"
+          ? collectHermesStartupDiagnostics(sandboxName, runCaptureOpenshell)
+          : [];
+      await failAgentSetup(
         sandboxName,
         agent,
         `${agent.displayName} gateway did not respond within ${timeoutSecs}s`,
+        recordStepFailed,
+        diagnostics,
       );
     }
   } else {
     console.log(`  \u2713 ${agent.displayName} configured inside sandbox`);
   }
 
-  onboardSession.markStepComplete("agent_setup", { sandboxName, provider, model });
+  await recordStepComplete("agent_setup", { sandboxName, provider, model });
 }
 
 /**
@@ -463,7 +554,7 @@ export function printDashboardUi(
   },
 ): void {
   const info = getAgentDashboardInfo(agent);
-  const { kind, label, path } = agent.dashboard;
+  const { auth, kind, label, path } = agent.dashboard;
   const cliName = getAgentBranding(agent.name).cli;
 
   if (kind === "api") {
@@ -475,6 +566,16 @@ export function printDashboardUi(
       const url = path && path !== "/" ? `${withoutHash}${path}` : `${withoutHash}/`;
       if (seen.has(url)) continue;
       seen.add(url);
+      console.log(`  ${dashboardUrlForDisplay(url)}`);
+    }
+    printOptionalDashboardUi(agent, { ...deps, redactUrl: dashboardUrlForDisplay });
+    return;
+  }
+
+  if (auth !== "url_token") {
+    console.log(`  ${info.displayName} ${label}`);
+    console.log(`  Port ${info.port} must be forwarded before opening this URL.`);
+    for (const url of deps.buildControlUiUrls(null, info.port)) {
       console.log(`  ${dashboardUrlForDisplay(url)}`);
     }
     return;
@@ -498,4 +599,5 @@ export function printDashboardUi(
       console.log(`  ${dashboardUrlForDisplay(url)}`);
     }
   }
+  printOptionalDashboardUi(agent, { ...deps, redactUrl: dashboardUrlForDisplay });
 }

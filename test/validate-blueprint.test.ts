@@ -13,12 +13,24 @@ import { describe, it, expect } from "vitest";
 import YAML from "yaml";
 
 const BLUEPRINT_PATH = new URL("../nemoclaw-blueprint/blueprint.yaml", import.meta.url);
+const ROUTER_POOL_CONFIG_PATH = new URL(
+  "../nemoclaw-blueprint/router/pool-config.yaml",
+  import.meta.url,
+);
 const BASE_POLICY_PATH = new URL(
   "../nemoclaw-blueprint/policies/openclaw-sandbox.yaml",
   import.meta.url,
 );
+const BRAVE_PROVIDER_PROFILE_PATH = new URL(
+  "../nemoclaw-blueprint/provider-profiles/brave.yaml",
+  import.meta.url,
+);
 const PERMISSIVE_POLICY_PATH = new URL(
   "../nemoclaw-blueprint/policies/openclaw-sandbox-permissive.yaml",
+  import.meta.url,
+);
+const HERMES_POLICY_PATH = new URL(
+  "../agents/hermes/policy-additions.yaml",
   import.meta.url,
 );
 const REQUIRED_PROFILE_FIELDS: ReadonlyArray<keyof BlueprintProfile> = [
@@ -40,6 +52,16 @@ type Blueprint = {
     sandbox?: { image?: string | null };
     inference?: { profiles?: Record<string, BlueprintProfile> };
   };
+};
+
+type RouterPoolModel = {
+  name?: string;
+  litellm_model?: string;
+  api_base?: string;
+};
+
+type RouterPoolConfig = {
+  models?: RouterPoolModel[];
 };
 
 type Rule = { allow?: { method?: string; path?: string } };
@@ -70,6 +92,26 @@ type SandboxPolicy = {
 type PolicyPreset = {
   preset?: { name?: string; description?: string };
   network_policies?: Record<string, PolicyEntry>;
+};
+
+type ProviderProfileCredential = {
+  env_vars?: string[];
+  auth_style?: string;
+  header_name?: string;
+};
+
+type ProviderProfileEndpoint = {
+  host?: string;
+  port?: number;
+  protocol?: string;
+  access?: string;
+  enforcement?: string;
+};
+
+type ProviderProfile = {
+  id?: string;
+  credentials?: ProviderProfileCredential[];
+  endpoints?: ProviderProfileEndpoint[];
 };
 
 function loadYaml<T>(path: URL): T {
@@ -161,6 +203,32 @@ describe("blueprint.yaml", () => {
       expect(declared).toContain(name);
     });
   }
+});
+
+describe("Model Router pool config", () => {
+  const pool = loadYaml<RouterPoolConfig>(ROUTER_POOL_CONFIG_PATH);
+
+  it("regression #3255: routes NVIDIA API keys to the public NVIDIA Build endpoint", () => {
+    const apiBases = new Set((pool.models ?? []).map((model) => model.api_base));
+    expect(apiBases).toEqual(new Set(["https://integrate.api.nvidia.com/v1"]));
+  });
+
+  it("regression #3255: uses valid LiteLLM NVIDIA model identifiers", () => {
+    const modelsByName = new Map(
+      (pool.models ?? []).map((model) => [model.name, model.litellm_model]),
+    );
+    expect(modelsByName.get("nemotron-3-nano-reasoning")).toBe(
+      "openai/nvidia/nemotron-3-nano-30b-a3b",
+    );
+    expect(modelsByName.get("nemotron-3-super")).toBe(
+      "openai/nvidia/nemotron-3-super-120b-a12b",
+    );
+    for (const litellmModel of modelsByName.values()) {
+      expect(litellmModel).not.toMatch(/nvidia\/nvidia\//);
+      expect(litellmModel).not.toContain("Nemotron-3-Nano-30B-A3B");
+      expect(litellmModel).not.toContain("nemotron-3-super-v3");
+    }
+  });
 });
 
 describe("base sandbox policy", () => {
@@ -344,6 +412,7 @@ describe("base sandbox policy", () => {
       (h) =>
         h === "discord.com" ||
         h === "gateway.discord.gg" ||
+        h === "*.discord.gg" ||
         h === "cdn.discordapp.com" ||
         h === "media.discordapp.net",
     );
@@ -382,6 +451,33 @@ describe("base sandbox policy", () => {
   });
 });
 
+describe("Brave Search provider profile", () => {
+  const profile = loadYaml<ProviderProfile>(BRAVE_PROVIDER_PROFILE_PATH);
+
+  it("routes BRAVE_API_KEY through Brave's subscription-token header", () => {
+    expect(profile.id).toBe("brave");
+    expect(profile.credentials).toEqual([
+      expect.objectContaining({
+        env_vars: ["BRAVE_API_KEY"],
+        auth_style: "header",
+        header_name: "x-subscription-token",
+      }),
+    ]);
+  });
+
+  it("matches the Brave Search API endpoint used by the policy preset", () => {
+    expect(profile.endpoints).toEqual([
+      expect.objectContaining({
+        host: "api.search.brave.com",
+        port: 443,
+        protocol: "rest",
+        access: "read-write",
+        enforcement: "enforce",
+      }),
+    ]);
+  });
+});
+
 describe("permissive sandbox policy", () => {
   // openclaw-sandbox-permissive.yaml is applied by `shields down --policy
   // permissive`. It must carry forward the gateway-managed inference route
@@ -415,6 +511,44 @@ describe("permissive sandbox policy", () => {
     // Matches the permissive-file convention used by every other block
     // (e.g. `nvidia`, `github`, `huggingface`, etc.).
     expect(binaries).toEqual(["/**"]);
+  });
+});
+
+describe("Hermes sandbox policy", () => {
+  const policy = loadYaml<SandboxPolicy>(HERMES_POLICY_PATH);
+
+  function expectManagedInferenceSecurityShape(): void {
+    const np = policy.network_policies ?? {};
+    const managedInference = np.managed_inference;
+    expect(managedInference?.name).toBe("managed_inference");
+    expect(managedInference?.binaries?.map((b) => b.path)).toEqual([
+      "/usr/local/bin/hermes",
+      "/usr/bin/python3.11",
+      "/opt/hermes/.venv/bin/python",
+    ]);
+
+    const endpoints = managedInference?.endpoints ?? [];
+    expect(endpoints).toHaveLength(1);
+    expect(endpoints[0]).toMatchObject({
+      host: "inference.local",
+      port: 443,
+      protocol: "rest",
+      enforcement: "enforce",
+    });
+    expect(endpoints[0].access).toBeUndefined();
+    expect(endpoints[0].rules).toEqual([
+      { allow: { method: "POST", path: "/v1/chat/completions" } },
+      { allow: { method: "POST", path: "/v1/messages" } },
+      { allow: { method: "POST", path: "/v1/responses" } },
+      { allow: { method: "POST", path: "/v1/completions" } },
+      { allow: { method: "POST", path: "/v1/embeddings" } },
+      { allow: { method: "GET", path: "/v1/models" } },
+      { allow: { method: "GET", path: "/v1/models/**" } },
+    ]);
+  }
+
+  it("regression #4230: managed_inference keeps a narrow inference API allowlist", () => {
+    expectManagedInferenceSecurityShape();
   });
 });
 
@@ -504,6 +638,24 @@ describe("huggingface preset", () => {
   });
 });
 
+describe("jira preset", () => {
+  const JIRA_PRESET_PATH = new URL(
+    "../nemoclaw-blueprint/policies/presets/jira.yaml",
+    import.meta.url,
+  );
+  const jiraPreset = loadYaml<PolicyPreset>(JIRA_PRESET_PATH);
+
+  it("regression #3758: Jira allows Node but not curl", () => {
+    const binaries = (jiraPreset.network_policies?.atlassian?.binaries ?? [])
+      .map((binary) => binary.path)
+      .sort();
+
+    expect(binaries).toEqual(["/usr/bin/node", "/usr/local/bin/node"]);
+    expect(binaries).not.toContain("/usr/bin/curl");
+    expect(binaries).not.toContain("/usr/local/bin/curl");
+  });
+});
+
 describe("messaging WebSocket presets", () => {
   const DISCORD_PRESET_PATH = new URL(
     "../nemoclaw-blueprint/policies/presets/discord.yaml",
@@ -519,6 +671,13 @@ describe("messaging WebSocket presets", () => {
       name: "discord",
       policyKey: "discord",
       host: "gateway.discord.gg",
+      credentialRewrite: true,
+      data: loadYaml<PolicyPreset>(DISCORD_PRESET_PATH),
+    },
+    {
+      name: "discord",
+      policyKey: "discord",
+      host: "*.discord.gg",
       credentialRewrite: true,
       data: loadYaml<PolicyPreset>(DISCORD_PRESET_PATH),
     },
